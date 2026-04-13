@@ -59,6 +59,27 @@ const Pool = function(poolConfig, portalConfig, authorizeFn, responseFn) {
   _this.checkAlgorithm(_this.poolConfig.primary.coin.algorithms.block);
   _this.checkAlgorithm(_this.poolConfig.primary.coin.algorithms.coinbase);
 
+  // Build GBT callConfig with optional Kerrigan extensions
+  this.buildCallConfig = function() {
+    const callConfig = {
+      'capabilities': [
+        'coinbasetxn',
+        'workid',
+        'coinbase/append'
+      ],
+      'rules': [],
+    };
+    if (_this.poolConfig.primary.coin.segwit) callConfig.rules.push('segwit');
+    if (_this.poolConfig.primary.coin.mweb) callConfig.rules.push('mweb');
+
+    // Kerrigan: tell daemon to build coinbase with pool payout address
+    if (_this.poolConfig.primary.coin.useCoinbasetxn) {
+      callConfig.pooladdress = _this.poolConfig.primary.address;
+    }
+
+    return callConfig;
+  };
+
   // Start Pool Capabilities
   /* istanbul ignore next */
   this.setupPool = function() {
@@ -327,16 +348,7 @@ const Pool = function(poolConfig, portalConfig, authorizeFn, responseFn) {
 
   // Load Current Block Template
   this.getBlockTemplate = function(callback, force) {
-    const callConfig = {
-      'capabilities': [
-        'coinbasetxn',
-        'workid',
-        'coinbase/append'
-      ],
-      'rules': [],
-    };
-    if (_this.poolConfig.primary.coin.segwit) callConfig.rules.push('segwit');
-    if (_this.poolConfig.primary.coin.mweb) callConfig.rules.push('mweb');
+    const callConfig = _this.buildCallConfig();
 
     // Handle Block Templates/Subsidy
     _this.primary.daemon.cmd('getblocktemplate', [callConfig], true, (result) => {
@@ -465,16 +477,7 @@ const Pool = function(poolConfig, portalConfig, authorizeFn, responseFn) {
   // Wait Until Blockchain is Fully Synced
   /* istanbul ignore next */
   this.setupBlockchain = function(callback) {
-    const callConfig = {
-      'capabilities': [
-        'coinbasetxn',
-        'workid',
-        'coinbase/append'
-      ],
-      'rules': [],
-    };
-    if (_this.poolConfig.primary.coin.segwit) callConfig.rules.push('segwit');
-    if (_this.poolConfig.primary.coin.mweb) callConfig.rules.push('mweb');
+    const callConfig = _this.buildCallConfig();
 
     // Calculate Current Progress on Sync
     const generateProgress = function() {
@@ -688,6 +691,11 @@ const Pool = function(poolConfig, portalConfig, authorizeFn, responseFn) {
         const extraNonce = _this.manager.extraNonceCounter.next();
         switch (_this.poolConfig.primary.coin.algorithms.mining) {
 
+        // Equihash Subscription
+        case 'equihash':
+          callback(null, extraNonce, _this.manager.extraNonce2Size);
+          break;
+
         // Kawpow/Firopow Subscription
         case 'kawpow':
         case 'firopow':
@@ -716,6 +724,27 @@ const Pool = function(poolConfig, portalConfig, authorizeFn, responseFn) {
       client.on('submit', (message, callback) => {
         let result, submission;
         switch (_this.poolConfig.primary.coin.algorithms.mining) {
+
+        // Equihash Submission
+        // mining.submit(worker, jobId, nTime, nonce, solution)
+        case 'equihash':
+          submission = {
+            extraNonce1: client.extraNonce1,
+            nTime: message.params[2],
+            nonce: message.params[3],
+            solution: message.params[4],
+          };
+          result = _this.manager.processShare(
+            message.params[1],
+            client.previousDifficulty,
+            client.difficulty,
+            client.remoteAddress,
+            client.socket.localPort,
+            client.addrPrimary,
+            client.addrAuxiliary,
+            submission,
+          );
+          break;
 
         // Kawpow/Firopow Submission
         case 'kawpow':

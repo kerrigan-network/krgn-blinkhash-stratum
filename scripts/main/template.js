@@ -25,6 +25,9 @@ const Template = function(poolConfig, rpcData, jobId, extraNoncePlaceholder, aux
   this.jobId = jobId;
 
   const algorithm = _this.poolConfig.primary.coin.algorithms.mining;
+  const useCoinbasetxn = !!(_this.poolConfig.primary.coin.useCoinbasetxn
+    && rpcData.coinbasetxn && rpcData.coinbasetxn.data);
+
   this.target = _this.rpcData.target ? bignum(_this.rpcData.target, 16) : utils.bignumFromBitsHex(_this.rpcData.bits);
   this.difficulty = parseFloat((Algorithms[algorithm].diff / _this.target.toNumber()).toFixed(9));
 
@@ -104,8 +107,25 @@ const Template = function(poolConfig, rpcData, jobId, extraNoncePlaceholder, aux
     return Buffer.from(tx.data, 'hex');
   }));
 
+  // Store raw coinbasetxn for equihash/kawpow when using daemon-built coinbase.
+  // The coinbase is used as-is (no extranonce injection). Merkle root is
+  // pre-computed once since the coinbase never changes per template.
+  this.coinbaseTxnRaw = null;
+  this.fixedMerkleRoot = null;
+  if (useCoinbasetxn && (algorithm === 'equihash' || algorithm === 'kawpow')) {
+    _this.coinbaseTxnRaw = Buffer.from(rpcData.coinbasetxn.data, 'hex');
+    const coinbaseHash = _this.coinbaseHasher(_this.coinbaseTxnRaw);
+    _this.fixedMerkleRoot = _this.merkle.withFirst(coinbaseHash);
+  }
+
   // Serialize Block Coinbase
   this.serializeCoinbase = function(extraNonce1, extraNonce2) {
+
+    // coinbasetxn mode for equihash/kawpow: return raw coinbase unchanged
+    if (_this.coinbaseTxnRaw) {
+      return _this.coinbaseTxnRaw;
+    }
+
     let buffer;
     switch (algorithm) {
 
@@ -138,6 +158,26 @@ const Template = function(poolConfig, rpcData, jobId, extraNoncePlaceholder, aux
     let position = 0;
     switch (algorithm) {
 
+    // Equihash 140-byte header
+    case 'equihash':
+      header = Buffer.alloc(140);
+      header.writeUInt32LE(version, 0);
+      Buffer.from(this.rpcData.previousblockhash, 'hex').copy(header, 4);
+      merkleRoot.copy(header, 36);
+      // finalsaplingroothash / reserved field (32 bytes)
+      if (this.rpcData.finalsaplingroothash) {
+        Buffer.from(this.rpcData.finalsaplingroothash, 'hex').copy(header, 68);
+      }
+      // nTime (4 LE)
+      header.writeUInt32LE(parseInt(nTime, 16), 100);
+      // nBits (4 bytes)
+      Buffer.from(this.rpcData.bits, 'hex').copy(header, 104);
+      // nNonce (32 bytes) -- filled from miner submission
+      if (typeof nonce === 'string' && nonce.length === 64) {
+        Buffer.from(nonce, 'hex').copy(header, 108);
+      }
+      return header;
+
     // Kawpow/Firopow Block Header
     case 'kawpow':
     case 'firopow':
@@ -168,6 +208,18 @@ const Template = function(poolConfig, rpcData, jobId, extraNoncePlaceholder, aux
   this.serializeBlock = function(header, coinbase, nonce, mixHash) {
     let buffer;
     switch (algorithm) {
+
+    // Equihash block: header(140) + solution + txcount + coinbase + txs
+    // mixHash is repurposed to carry the compactSize-prefixed solution bytes
+    case 'equihash':
+      buffer = Buffer.concat([
+        header,
+        mixHash,
+        utils.varIntBuffer(_this.rpcData.transactions.length + 1),
+        coinbase,
+        _this.transactions,
+      ]);
+      break;
 
     // Kawpow/Firopow Block Structure
     case 'kawpow':
@@ -224,6 +276,35 @@ const Template = function(poolConfig, rpcData, jobId, extraNoncePlaceholder, aux
 
     // Process Job Parameters
     switch (algorithm) {
+
+    // Equihash parameters (Z-NOMP compatible notify format)
+    case 'equihash':
+
+      // Compute merkle root for this client
+      if (_this.fixedMerkleRoot) {
+        merkleRoot = _this.fixedMerkleRoot;
+      } else {
+        extraNonce1Buffer = Buffer.from(client.extraNonce1 || '00000000', 'hex');
+        coinbaseBuffer = _this.serializeCoinbase(
+          extraNonce1Buffer,
+          Buffer.alloc(_this.poolConfig.primary.coin.extraNonce2Size || 4));
+        coinbaseHash = _this.coinbaseHasher(coinbaseBuffer);
+        merkleRoot = _this.merkle.withFirst(coinbaseHash);
+      }
+
+      version = utils.packUInt32LE(_this.rpcData.version).toString('hex');
+      nTime = utils.packUInt32LE(_this.rpcData.curtime).toString('hex');
+
+      return [
+        _this.jobId,
+        version,
+        _this.rpcData.previousblockhash,
+        merkleRoot.toString('hex'),
+        _this.rpcData.finalsaplingroothash || '0'.repeat(64),
+        nTime,
+        _this.rpcData.bits,
+        cleanJobs,
+      ];
 
     // Kawpow/Firopow Parameters
     case 'kawpow':

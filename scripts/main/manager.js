@@ -131,6 +131,138 @@ const Manager = function(poolConfig, portalConfig) {
     /* istanbul ignore next */
     switch (algorithm) {
 
+    // Equihash Share Submission
+    case 'equihash':
+
+      // Edge Cases to Check if Share is Invalid
+      submitTime = Date.now() / 1000 | 0;
+      job = _this.validJobs[jobId];
+      if (typeof job === 'undefined' || job.jobId != jobId) {
+        return shareError([21, 'job not found']);
+      }
+      if (!submission.nonce || submission.nonce.length !== 64) {
+        return shareError([20, 'incorrect size of nonce']);
+      }
+      if (!submission.solution) {
+        return shareError([20, 'missing equihash solution']);
+      }
+      nTimeInt = parseInt(submission.nTime, 16);
+      if (nTimeInt < job.rpcData.curtime || nTimeInt > submitTime + 7200) {
+        return shareError([20, 'ntime out of range']);
+      }
+      if (!addrPrimary && !addrAuxiliary) {
+        return shareError([20, 'worker address isn\'t set properly']);
+      }
+      if (!job.registerSubmit([submission.nonce, submission.nTime, submission.solution.slice(0, 20)])) {
+        return shareError([22, 'duplicate share']);
+      }
+
+      // Establish Share Information
+      blockValid = false;
+      version = job.rpcData.version;
+      nTime = submission.nTime;
+
+      // Get coinbase + merkle root
+      if (job.fixedMerkleRoot) {
+        merkleRoot = job.fixedMerkleRoot;
+      } else {
+        extraNonce1Buffer = Buffer.from(submission.extraNonce1, 'hex');
+        extraNonce2Buffer = Buffer.from(submission.extraNonce2 || '00000000', 'hex');
+        coinbaseBuffer = job.serializeCoinbase(extraNonce1Buffer, extraNonce2Buffer);
+        coinbaseHash = job.coinbaseHasher(coinbaseBuffer);
+        merkleRoot = job.merkle.withFirst(coinbaseHash);
+      }
+
+      // Build 140-byte header with miner's nonce
+      headerBuffer = job.serializeHeader(merkleRoot, nTime, submission.nonce, version);
+
+      // Verify equihash solution
+      headerDigest = Algorithms[algorithm].hash(_this.poolConfig.primary.coin);
+      const solutionBuf = Buffer.from(submission.solution, 'hex');
+      const eqValid = headerDigest(headerBuffer, solutionBuf);
+
+      if (!eqValid) {
+        return shareError([20, 'invalid equihash solution']);
+      }
+
+      // Block hash for difficulty check (always uses algorithms.block, e.g. x11)
+      const blockAlgo = _this.poolConfig.primary.coin.algorithms.block;
+      const eqBlockHashDigest = Algorithms[blockAlgo].hash(_this.poolConfig.primary.coin);
+      headerHash = eqBlockHashDigest(headerBuffer, nTimeInt);
+      headerBigNum = bignum.fromBuffer(headerHash, {endian: 'little', size: 32});
+
+      // Calculate Share Difficulty
+      shareDiff = Algorithms[algorithm].diff / headerBigNum.toNumber() * shareMultiplier;
+      blockDiffAdjusted = job.difficulty * shareMultiplier;
+
+      // Coinbase for block submission
+      if (job.coinbaseTxnRaw) {
+        coinbaseBuffer = job.coinbaseTxnRaw;
+      } else if (!coinbaseBuffer) {
+        extraNonce1Buffer = Buffer.from(submission.extraNonce1, 'hex');
+        extraNonce2Buffer = Buffer.from(submission.extraNonce2 || '00000000', 'hex');
+        coinbaseBuffer = job.serializeCoinbase(extraNonce1Buffer, extraNonce2Buffer);
+      }
+
+      // Build block hex (solution passed via mixHash param)
+      blockHex = job.serializeBlock(headerBuffer, coinbaseBuffer, null, solutionBuf).toString('hex');
+      blockHash = job.blockHasher(headerBuffer, nTimeInt).toString('hex');
+
+      // Check if Share is Valid Block Candidate
+      if (job.target.ge(headerBigNum)) {
+        blockValid = true;
+      } else {
+        if (shareDiff / difficulty < 0.99) {
+          if (previousDifficulty && shareDiff >= previousDifficulty) {
+            difficulty = previousDifficulty;
+          } else {
+            return shareError([23, 'low difficulty share of ' + shareDiff]);
+          }
+        }
+      }
+
+      // Build Share Object Data
+      shareData = {
+        job: jobId,
+        ip: ipAddress,
+        port: port,
+        addrPrimary: addrPrimary,
+        addrAuxiliary: addrAuxiliary,
+        blockDiffPrimary : blockDiffAdjusted,
+        blockType: blockValid ? 'primary' : 'share',
+        coinbase: coinbaseBuffer,
+        difficulty: difficulty,
+        hash: blockHash,
+        hex: blockHex,
+        header: headerHash,
+        headerDiff: headerBigNum,
+        height: job.rpcData.height,
+        identifier: identifier,
+        reward: job.rpcData.coinbasevalue,
+        shareDiff: shareDiff.toFixed(8),
+      };
+
+      auxShareData = {
+        job: jobId,
+        ip: ipAddress,
+        port: port,
+        addrPrimary: addrPrimary,
+        addrAuxiliary: addrAuxiliary,
+        blockDiffPrimary : blockDiffAdjusted,
+        blockType: 'auxiliary',
+        coinbase: coinbaseBuffer,
+        difficulty: difficulty,
+        hash: blockHash,
+        hex: blockHex,
+        header: headerHash,
+        headerDiff: headerBigNum,
+        identifier: identifier,
+        shareDiff: shareDiff.toFixed(8),
+      };
+
+      _this.emit('share', shareData, auxShareData, blockValid);
+      return { error: null, hash: blockHash, hex: blockHex, result: true };
+
     // Kawpow/Firopow Share Submission
     case 'kawpow':
     case 'firopow':
@@ -206,7 +338,11 @@ const Manager = function(poolConfig, portalConfig) {
       blockHex = job.serializeBlock(headerBuffer, coinbaseBuffer, nonceBuffer, mixHashBuffer).toString('hex');
 
       // Generate Output Block Hash
-      if (algorithm === 'firopow') {
+      // When algorithms.block differs from mining algo (e.g. Kerrigan uses
+      // x11 for block hash regardless of mining algo), use blockHasher.
+      if (_this.poolConfig.primary.coin.algorithms.block !== algorithm) {
+        blockHash = job.blockHasher(headerBuffer, nTime).toString('hex');
+      } else if (algorithm === 'firopow') {
         combinedBuffer = Buffer.alloc(120);
         headerBuffer.copy(combinedBuffer);
         merkleRoot.copy(combinedBuffer, 36);

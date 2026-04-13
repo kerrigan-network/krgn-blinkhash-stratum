@@ -11,8 +11,108 @@ const utils = require('./utils');
 // Main Transactions Function
 const Transactions = function() {
 
+  // Split daemon-built coinbasetxn into [p1, p2] for extranonce injection.
+  // Used when useCoinbasetxn is set and the mining algo needs extranonce
+  // variation in the scriptSig (x11/default path). For equihash and kawpow,
+  // miners vary the header nonce so extranonce injection is unnecessary --
+  // the caller should use getCoinbasetxnRaw() instead.
+  //
+  // Parses the raw coinbasetxn to find the scriptSig, locates the height
+  // push at its start, and splits there. p1 = everything up to and
+  // including the height serialization. p2 = sequence + outputs + locktime
+  // + optional extra payload. The gap between p1 and p2 is filled with
+  // extranonce1 + extranonce2 at share time.
+  this.splitCoinbasetxn = function(coinbasetxnHex, extraNoncePlaceholder) {
+    const raw = Buffer.from(coinbasetxnHex, 'hex');
+    let offset = 0;
+
+    // version (4 bytes)
+    offset += 4;
+
+    // txin count (varint, always 1 for coinbase)
+    offset += 1;
+
+    // prevout hash (32 bytes, all zeros for coinbase)
+    offset += 32;
+
+    // prevout index (4 bytes, 0xffffffff)
+    offset += 4;
+
+    // scriptSig length (varint)
+    const scriptSigLenByte = raw[offset];
+    let scriptSigLenBytes = 1;
+    let actualScriptSigLen = scriptSigLenByte;
+    if (scriptSigLenByte === 0xfd) {
+      actualScriptSigLen = raw.readUInt16LE(offset + 1);
+      scriptSigLenBytes = 3;
+    } else if (scriptSigLenByte === 0xfe) {
+      actualScriptSigLen = raw.readUInt32LE(offset + 1);
+      scriptSigLenBytes = 5;
+    }
+    const scriptSigStart = offset + scriptSigLenBytes;
+    offset = scriptSigStart;
+
+    // Height push: [pushlen] [height bytes LE]
+    const heightPushLen = raw[offset];
+    const heightEnd = offset + 1 + heightPushLen;
+    const scriptSigEnd = scriptSigStart + actualScriptSigLen;
+
+    // Rewrite scriptSig length: height push + extranonce placeholder
+    const extraNonceLen = extraNoncePlaceholder.length;
+    const newScriptSigLen = (heightEnd - scriptSigStart) + extraNonceLen;
+
+    let newLenBuf;
+    if (newScriptSigLen < 0xfd) {
+      newLenBuf = Buffer.from([newScriptSigLen]);
+    } else if (newScriptSigLen <= 0xffff) {
+      newLenBuf = Buffer.alloc(3);
+      newLenBuf[0] = 0xfd;
+      newLenBuf.writeUInt16LE(newScriptSigLen, 1);
+    } else {
+      newLenBuf = Buffer.alloc(5);
+      newLenBuf[0] = 0xfe;
+      newLenBuf.writeUInt32LE(newScriptSigLen, 1);
+    }
+
+    // p1: version + txin_count + prevout + rewritten scriptSig len + height push
+    const p1 = Buffer.concat([
+      raw.slice(0, scriptSigStart - scriptSigLenBytes),
+      newLenBuf,
+      raw.slice(scriptSigStart, heightEnd),
+    ]);
+
+    // p2: sequence + outputs + locktime + optional extra payload
+    const p2 = raw.slice(scriptSigEnd);
+
+    return [p1, p2];
+  };
+
+  // Return the coinbasetxn as a single raw buffer. Used for equihash
+  // and kawpow where the miner varies the header nonce instead of the
+  // extranonce in the coinbase scriptSig.
+  this.getCoinbasetxnRaw = function(coinbasetxnHex) {
+    return Buffer.from(coinbasetxnHex, 'hex');
+  };
+
   // Default Transaction Protocol
   this.default = function(poolConfig, rpcData, extraNoncePlaceholder, auxMerkle) {
+
+    // Coinbasetxn bypass: daemon builds the coinbase, pool uses it as-is
+    // or splits it for extranonce injection depending on mining algo.
+    if (poolConfig.primary.coin.useCoinbasetxn && rpcData.coinbasetxn && rpcData.coinbasetxn.data) {
+      const algo = poolConfig.primary.coin.algorithms.mining;
+      if (algo === 'equihash' || algo === 'kawpow') {
+        // No extranonce needed, miners vary header nonce.
+        // Return [full_tx, empty] so serializeCoinbase still works:
+        // Buffer.concat([generation[0], extraNonce1, generation[1]])
+        // becomes just the raw coinbase (extraNonce1 is prepended but
+        // we handle this in template.serializeCoinbase).
+        const raw = this.getCoinbasetxnRaw(rpcData.coinbasetxn.data);
+        return [raw, Buffer.alloc(0)];
+      }
+      // x11/default: split coinbasetxn for extranonce injection
+      return this.splitCoinbasetxn(rpcData.coinbasetxn.data, extraNoncePlaceholder);
+    }
 
     const txLockTime = 0;
     const txInSequence = 0;
